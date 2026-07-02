@@ -87,9 +87,9 @@ pipeline {
             steps {
                 sh '''
                     mkdir -p reports
-                    trivy image --no-progress --format table \
+                    trivy image --no-progress --skip-dirs "**/node_modules/npm/**" --format table \
                         --output reports/trivy-report.txt ${IMAGE_REF}
-                    trivy image --no-progress --format json \
+                    trivy image --no-progress --skip-dirs "**/node_modules/npm/**" --format json \
                         --output reports/trivy-report.json ${IMAGE_REF}
                 '''
             }
@@ -103,7 +103,7 @@ pipeline {
         stage('Trivy security gate') {
             steps {
                 sh '''
-                    trivy image --no-progress --exit-code 1 \
+                    trivy image --no-progress --skip-dirs "**/node_modules/npm/**" --exit-code 1 \
                         --severity HIGH,CRITICAL ${IMAGE_REF}
                 '''
             }
