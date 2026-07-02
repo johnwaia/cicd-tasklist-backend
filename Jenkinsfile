@@ -1,30 +1,144 @@
-node {
-  def nodejs = tool name: 'Node20', type: 'jenkins.plugins.nodejs.tools.NodeJSInstallation'
-  env.PATH = "${nodejs}/bin:${env.PATH}"
+pipeline {
+    agent any
 
-  def dockerImage = "johnwaia/cicd-tasklist-backend"
+    tools {
+        nodejs 'Node20'
+    }
 
-  stage('SCM') {
-    checkout scm
-  }
-  stage('Install & Test') {
-    sh 'npm ci'
-    sh 'npm run test:coverage'
-  }
-  stage('SonarQube Analysis') {
-    def scannerHome = tool 'SonarScanner';
-    withSonarQubeEnv() {
-      sh "${scannerHome}/bin/sonar-scanner"
+    environment {
+        DOCKERHUB_CRED = credentials('dockerhub-credentials')
+
+        IMAGE_NAME = "${DOCKERHUB_CRED_USR}/cicd-tasklist-backend"
+        IMAGE_TAG  = "${BUILD_NUMBER}"
+        IMAGE_REF  = "${IMAGE_NAME}:${IMAGE_TAG}"
     }
-  }
-  stage('Docker Build') {
-    sh "docker build -t ${dockerImage}:${env.BUILD_NUMBER} -t ${dockerImage}:latest ."
-  }
-  stage('Docker Push') {
-    withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-      sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
-      sh "docker push ${dockerImage}:${env.BUILD_NUMBER}"
-      sh "docker push ${dockerImage}:latest"
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
     }
-  }
+
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+
+    stages {
+
+        stage('Install dependencies') {
+            steps {
+                sh 'npm ci'
+            }
+        }
+
+        stage('Prisma generate') {
+            steps {
+                sh 'npm run prisma:generate'
+            }
+        }
+
+        stage('Unit tests') {
+            steps {
+                sh 'npm run test:coverage'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'reports/junit.xml'
+                }
+            }
+        }
+
+        stage('End-to-end tests') {
+            steps {
+                sh 'npm run test:e2e -- --outputFile.junit=reports/junit-e2e.xml'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'reports/junit-e2e.xml'
+                }
+            }
+        }
+
+        stage('SonarQube analysis') {
+            steps {
+                script {
+                    def scannerHome = tool 'SonarScanner'
+                    withSonarQubeEnv() {
+                        sh "${scannerHome}/bin/sonar-scanner"
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Docker image') {
+            steps {
+                sh 'docker build -t ${IMAGE_REF} -t ${IMAGE_NAME}:latest .'
+            }
+        }
+
+        stage('Trivy scan + reports') {
+            steps {
+                sh '''
+                    mkdir -p reports
+                    trivy image --no-progress --format table \
+                        --output reports/trivy-report.txt ${IMAGE_REF}
+                    trivy image --no-progress --format json \
+                        --output reports/trivy-report.json ${IMAGE_REF}
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/trivy-report.*', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Trivy security gate') {
+            steps {
+                sh '''
+                    trivy image --no-progress --exit-code 1 \
+                        --severity HIGH,CRITICAL ${IMAGE_REF}
+                '''
+            }
+        }
+
+        stage('Generate SBOM') {
+            steps {
+                sh '''
+                    mkdir -p reports
+                    trivy image --no-progress --format cyclonedx \
+                        --output reports/sbom.cdx.json ${IMAGE_REF}
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/sbom.cdx.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Push Docker image') {
+            steps {
+                sh '''
+                    echo "${DOCKERHUB_CRED_PSW}" | docker login -u "${DOCKERHUB_CRED_USR}" --password-stdin
+                    docker push ${IMAGE_REF}
+                    docker push ${IMAGE_NAME}:latest
+                    docker logout
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            deleteDir()
+        }
+    }
 }
